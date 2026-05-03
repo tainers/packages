@@ -12,6 +12,10 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: build-all
+  cancel-in-progress: true
+
 jobs:
   prepare:
     runs-on: ubuntu-latest
@@ -34,10 +38,9 @@ jobs:
           # list all directories that contain a Dockerfile
           mapfile -t all_dirs < <(find . -type f -name Dockerfile -print0 | xargs -0 -n1 dirname | sed 's|^\./||' | sort -u)
 
-          # helper to produce JSON include entries
+          # helper to produce image names from Dockerfile folders
           make_entry() {
             ctx="$1"
-            # image name defaults to directory name (use . -> root)
             if [ "$ctx" = '.' ] || [ -z "$ctx" ]; then
               img="root"
             else
@@ -46,55 +49,58 @@ jobs:
             printf '{"context":"%s","image":"%s"}' "$ctx" "$img"
           }
 
-          include_entries=()
+          selected_dirs=()
 
           event_name="${EVENT_NAME}"
 
           if [ "$event_name" = "workflow_dispatch" ] || [ "$event_name" = "workflow_call" ]; then
-            # manual run: build everything
-            for d in "${all_dirs[@]}"; do
-              include_entries+=("$(make_entry "$d")")
-            done
+            # manual run: rebuild everything
+            selected_dirs=("${all_dirs[@]}")
           else
-            # on push: build only added or modified files/folders
+            # on push: build only Dockerfile folders touched by the change
             before="${BEFORE:-}"
             sha="${SHA:-}"
             if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
-              # no prior ref: treat as initial push -> build all
-              for d in "${all_dirs[@]}"; do
-                include_entries+=("$(make_entry "$d")")
-              done
+              # no prior ref: treat as initial push -> build everything
+              selected_dirs=("${all_dirs[@]}")
             else
               mapfile -t changed < <(git diff --name-only --diff-filter=AM "$before" "$sha" || true)
               for d in "${all_dirs[@]}"; do
                 for f in "${changed[@]}"; do
                   nf="${f#./}"
-                  if [ "$d" = '.' ] || [ -z "$d" ]; then
-                    # root Dockerfile: trigger if top-level file or Dockerfile changed
-                    if [[ "$nf" == "Dockerfile" ]] || [[ "$nf" != */* ]]; then
-                      include_entries+=("$(make_entry "$d")")
-                      break
-                    fi
-                  else
-                    if [[ "$nf" == "$d/"* ]] || [[ "$nf" == "$d/Dockerfile" ]] || [[ "$nf" == "$d" ]]; then
-                      include_entries+=("$(make_entry "$d")")
-                      break
-                    fi
+                  if [[ "$nf" == "$d/"* ]] || [[ "$nf" == "$d/Dockerfile" ]] || [[ "$nf" == "$d" ]]; then
+                    selected_dirs+=("$d")
+                    break
                   fi
                 done
               done
+
+              # if nothing Docker-related changed, rebuild everything
+              if [ ${#selected_dirs[@]} -eq 0 ]; then
+                selected_dirs=("${all_dirs[@]}")
+              fi
             fi
           fi
 
-          # dedupe entries
-          if [ ${#include_entries[@]} -eq 0 ]; then
-            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+          # dedupe and build a real matrix axis so GitHub Actions accepts it
+          mapfile -t unique_dirs < <(printf "%s\n" "${selected_dirs[@]}" | sort -u)
+          if [ ${#unique_dirs[@]} -eq 0 ]; then
             echo "No Docker contexts to build."
-            exit 0
+            exit 1
           fi
 
-          uniq_entries=$(printf "%s\n" "${include_entries[@]}" | sort -u | paste -sd, -)
-          matrix_json="{\"include\":[${uniq_entries}] }"
+          matrix_json=$(ruby -e '
+            require "json"
+            dirs = ARGV
+            matrix = {
+              "context" => dirs,
+              "include" => dirs.map do |ctx|
+                img = (ctx == "." || ctx.empty?) ? "root" : File.basename(ctx)
+                { "context" => ctx, "image" => img }
+              end,
+            }
+            puts JSON.generate(matrix)
+          ' "${unique_dirs[@]}")
           echo "matrix=${matrix_json}" >> "$GITHUB_OUTPUT"
 
   build:
@@ -120,23 +126,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels) for Docker
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ghcr.io/${{ github.repository }}:${{ matrix.image }}
-          tags: |
-            type=ref,event=branch
-            type=sha
-            type=raw,value=latest${{ matrix.tag-suffix }}
-
       - name: Build image
         uses: docker/build-push-action@v5
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.context }}/Dockerfile
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=registry,ref=ghcr.io/hack-flare/hackflare:buildcache
-          cache-to: type=registry,ref=ghcr.io/hack-flare/hackflare:buildcache,mode=max
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ matrix.image }}-${{ github.sha }}
+            ghcr.io/${{ github.repository }}:${{ matrix.image }}-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
