@@ -116,14 +116,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}:${{ matrix.image }}
+          tags: |
+            type=ref,event=branch
+            type=sha
+            type=raw,value=latest${{ matrix.tag-suffix }}
+
       - name: Build image
         uses: docker/build-push-action@v5
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.context }}/Dockerfile
           push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ matrix.image }}-${{ github.sha }}
-            ghcr.io/${{ github.repository }}:${{ matrix.image }}-latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=ghcr.io/hack-flare/hackflare:buildcache
+          cache-to: type=registry,ref=ghcr.io/hack-flare/hackflare:buildcache,mode=max
