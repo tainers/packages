@@ -1,0 +1,129 @@
+name: Build All
+
+# Builds every dockerfile in the repo as a matrix in parallel. 
+# Only builds images changed in the commit, but can be triggered manually to build all images.
+
+on:
+  push:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine Docker contexts
+        id: set-matrix
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # list all directories that contain a Dockerfile
+          mapfile -t all_dirs < <(find . -type f -name Dockerfile -print0 | xargs -0 -n1 dirname | sed 's|^\./||' | sort -u)
+
+          # helper to produce JSON include entries
+          make_entry() {
+            ctx="$1"
+            # image name defaults to directory name (use . -> root)
+            if [ "$ctx" = '.' ] || [ -z "$ctx" ]; then
+              img="root"
+            else
+              img=$(basename "$ctx")
+            fi
+            printf '{"context":"%s","image":"%s"}' "$ctx" "$img"
+          }
+
+          include_entries=()
+
+          event_name="${EVENT_NAME}"
+
+          if [ "$event_name" = "workflow_dispatch" ] || [ "$event_name" = "workflow_call" ]; then
+            # manual run: build everything
+            for d in "${all_dirs[@]}"; do
+              include_entries+=("$(make_entry "$d")")
+            done
+          else
+            # on push: build only added or modified files/folders
+            before="${BEFORE:-}"
+            sha="${SHA:-}"
+            if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+              # no prior ref: treat as initial push -> build all
+              for d in "${all_dirs[@]}"; do
+                include_entries+=("$(make_entry "$d")")
+              done
+            else
+              mapfile -t changed < <(git diff --name-only --diff-filter=AM "$before" "$sha" || true)
+              for d in "${all_dirs[@]}"; do
+                for f in "${changed[@]}"; do
+                  nf="${f#./}"
+                  if [ "$d" = '.' ] || [ -z "$d" ]; then
+                    # root Dockerfile: trigger if top-level file or Dockerfile changed
+                    if [[ "$nf" == "Dockerfile" ]] || [[ "$nf" != */* ]]; then
+                      include_entries+=("$(make_entry "$d")")
+                      break
+                    fi
+                  else
+                    if [[ "$nf" == "$d/"* ]] || [[ "$nf" == "$d/Dockerfile" ]] || [[ "$nf" == "$d" ]]; then
+                      include_entries+=("$(make_entry "$d")")
+                      break
+                    fi
+                  fi
+                done
+              done
+            fi
+          fi
+
+          # dedupe entries
+          if [ ${#include_entries[@]} -eq 0 ]; then
+            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "No Docker contexts to build."
+            exit 0
+          fi
+
+          uniq_entries=$(printf "%s\n" "${include_entries[@]}" | sort -u | paste -sd, -)
+          matrix_json="{\"include\":[${uniq_entries}] }"
+          echo "matrix=${matrix_json}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.context }}/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ matrix.image }}-${{ github.sha }}
+            ghcr.io/${{ github.repository }}:${{ matrix.image }}-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
