@@ -137,3 +137,36 @@ jobs:
             ghcr.io/${{ github.repository }}:${{ matrix.image }}-latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Verify package published to GHCR
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          OWNER=${GITHUB_REPO%/*}
+          REPO=${GITHUB_REPO#*/}
+          TOKEN="${GITHUB_TOKEN}"
+
+          api_org="https://api.github.com/orgs/${OWNER}/packages/container/${REPO}"
+          api_user="https://api.github.com/users/${OWNER}/packages/container/${REPO}"
+
+          echo "Checking GHCR package at org endpoint: $api_org"
+          status=$(curl -sSL -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${TOKEN}" -H "Accept: application/vnd.github+json" "$api_org" || true)
+          if [ "$status" -eq 200 ]; then
+            echo "Package found at org endpoint"
+            curl -sSL -H "Authorization: Bearer ${TOKEN}" -H "Accept: application/vnd.github+json" "$api_org" | jq '.' || true
+            exit 0
+          fi
+
+          echo "Not found at org endpoint (status $status), trying user endpoint: $api_user"
+          status2=$(curl -sSL -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${TOKEN}" -H "Accept: application/vnd.github+json" "$api_user" || true)
+          if [ "$status2" -eq 200 ]; then
+            echo "Package found at user endpoint"
+            curl -sSL -H "Authorization: Bearer ${TOKEN}" -H "Accept: application/vnd.github+json" "$api_user" | jq '.' || true
+            exit 0
+          fi
+
+          echo "Package not found at GHCR (checked org and user endpoints). HTTP statuses: $status / $status2"
+          exit 1
